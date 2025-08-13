@@ -47,12 +47,16 @@ class Diffusion:
         model.train()
         x = x.clamp(-1, 1)
         return x
-        
+  
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
 class SelfAttention(nn.Module):
     def __init__(self, channels, size):
         super(SelfAttention, self).__init__()
         self.channels = channels
-        self.size = size
         self.mha = nn.MultiheadAttention(channels, 4, batch_first=True)
         self.ln = nn.LayerNorm([channels])
         self.ff_self = nn.Sequential(
@@ -63,12 +67,20 @@ class SelfAttention(nn.Module):
         )
 
     def forward(self, x):
-        x = x.view(-1, self.channels, self.size * self.size).swapaxes(1, 2)
-        x_ln = self.ln(x)
-        attention_value, _ = self.mha(x_ln, x_ln, x_ln)
-        attention_value = attention_value + x
-        attention_value = self.ff_self(attention_value) + attention_value
-        return attention_value.swapaxes(2, 1).view(-1, self.channels, self.size, self.size)
+        batch_size, channels, height, width = x.shape
+        # Reshape: (batch, height*width, channels)
+        x_flat = x.view(batch_size, channels, height * width).transpose(1, 2)
+        
+        # Attention
+        x_ln = self.ln(x_flat)
+        attn_out, _ = self.mha(x_ln, x_ln, x_ln)
+        attn_out = attn_out + x_flat
+        
+        # Feed forward
+        ff_out = self.ff_self(attn_out) + attn_out
+        
+        # Reshape back: (batch, channels, height, width)
+        return ff_out.transpose(1, 2).view(batch_size, channels, height, width)
 
 
 class DoubleConv(nn.Module):
@@ -78,12 +90,10 @@ class DoubleConv(nn.Module):
         if not mid_channels:
             mid_channels = out_channels
         self.double_conv = nn.Sequential(
-            nn.Conv2d(in_channels, mid_channels,
-                      kernel_size=3, padding=1, bias=False),
+            nn.Conv2d(in_channels, mid_channels, kernel_size=3, padding=1, bias=False),
             nn.GroupNorm(1, mid_channels),
             nn.GELU(),
-            nn.Conv2d(mid_channels, out_channels,
-                      kernel_size=3, padding=1, bias=False),
+            nn.Conv2d(mid_channels, out_channels, kernel_size=3, padding=1, bias=False),
             nn.GroupNorm(1, out_channels),
         )
 
@@ -102,54 +112,61 @@ class Down(nn.Module):
             DoubleConv(in_channels, in_channels, residual=True),
             DoubleConv(in_channels, out_channels),
         )
-
         self.emb_layer = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(
-                emb_dim,
-                out_channels
-            ),
+            nn.Linear(emb_dim, out_channels),
         )
 
-    def forward(self, x, t):
+    def forward(self, x, emb, y_emb=None):
         x = self.maxpool_conv(x)
-        emb = self.emb_layer(t)[:, :, None, None].repeat(
-            1, 1, x.shape[-2], x.shape[-1])
-        return x + emb
+        # Procesar embedding combinado
+        if y_emb is not None:
+            combined_emb = emb + y_emb  # Suma de embeddings
+        else:
+            combined_emb = emb
+            
+        emb_out = self.emb_layer(combined_emb)
+        emb_out = emb_out.unsqueeze(-1).unsqueeze(-1)
+        emb_out = emb_out.expand(-1, -1, x.shape[-2], x.shape[-1])
+        return x + emb_out
 
 
 class Up(nn.Module):
     def __init__(self, in_channels, out_channels, emb_dim=256):
         super().__init__()
-
-        self.up = nn.Upsample(
-            scale_factor=2, mode="bilinear", align_corners=True)
+        self.up = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=True)
         self.conv = nn.Sequential(
             DoubleConv(in_channels, in_channels, residual=True),
             DoubleConv(in_channels, out_channels, in_channels // 2),
         )
-
         self.emb_layer = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(
-                emb_dim,
-                out_channels
-            ),
+            nn.Linear(emb_dim, out_channels),
         )
 
-    def forward(self, x, skip_x, t):
+    def forward(self, x, skip_x, emb, y_emb=None):
         x = self.up(x)
         x = torch.cat([skip_x, x], dim=1)
         x = self.conv(x)
-        emb = self.emb_layer(t)[:, :, None, None].repeat(
-            1, 1, x.shape[-2], x.shape[-1])
-        return x + emb
+        
+        # Procesar embedding combinado
+        if y_emb is not None:
+            combined_emb = emb + y_emb
+        else:
+            combined_emb = emb
+            
+        emb_out = self.emb_layer(combined_emb)
+        emb_out = emb_out.unsqueeze(-1).unsqueeze(-1)
+        emb_out = emb_out.expand(-1, -1, x.shape[-2], x.shape[-1])
+        return x + emb_out
+
 
 class UNet_conditional(nn.Module):
     def __init__(self, c_in=1, c_out=1, time_dim=256, num_classes=None, device="cuda"):
         super().__init__()
         self.device = device
         self.time_dim = time_dim
+        
         self.inc = DoubleConv(c_in, 64)
         self.down1 = Down(64, 128)
         self.sa1 = SelfAttention(128, 32)
@@ -169,46 +186,66 @@ class UNet_conditional(nn.Module):
         self.up3 = Up(128, 64)
         self.sa6 = SelfAttention(64, 64)
         self.outc = nn.Conv2d(64, c_out, kernel_size=1)
-        self.conv1=nn.Linear(in_features=1,out_features=time_dim)
-        self.relu1=nn.ReLU()
-        self.conv2=nn.Linear(in_features=time_dim,out_features=time_dim)
-        self.relu2=nn.ReLU()
-    def pos_encoding(self, t, channels):
-        inv_freq = 1.0 / (
-            10000
-            ** (torch.arange(0, channels, 2, device=self.device).float() / channels)
+        
+        # Procesamiento de embeddings
+        self.label_emb = nn.Sequential(
+            nn.Linear(1, time_dim),
+            nn.SiLU(),
+            nn.Linear(time_dim, time_dim),
         )
-        pos_enc_a = torch.sin(t.repeat(1, channels // 2) * inv_freq)
-        pos_enc_b = torch.cos(t.repeat(1, channels // 2) * inv_freq)
-        pos_enc = torch.cat([pos_enc_a, pos_enc_b], dim=-1)
+
+    def pos_encoding(self, t, channels):
+        # t shape: (batch_size, 1)
+        batch_size = t.shape[0]
+        
+        # Crear frecuencias
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, channels, 2, device=self.device).float() / channels))
+        
+        # Broadcasting correcto
+        t_expanded = t * inv_freq.unsqueeze(0)  # (batch_size, channels//2)
+        
+        # Calcular sin/cos
+        pos_enc_sin = torch.sin(t_expanded)
+        pos_enc_cos = torch.cos(t_expanded)
+        
+        # Intercalar sin/cos para obtener dimensión completa
+        pos_enc = torch.zeros(batch_size, channels, device=self.device)
+        pos_enc[:, 0::2] = pos_enc_sin
+        pos_enc[:, 1::2] = pos_enc_cos
+        
         return pos_enc
 
     def forward(self, x, t, y):
-        t = t.unsqueeze(-1).type(torch.float)
-        y = y.type(torch.float)
-        t = self.pos_encoding(t, self.time_dim)
+        # Procesar timestep
+        t = t.unsqueeze(-1).float()
+        t_emb = self.pos_encoding(t, self.time_dim)
+        
+        # Procesar labels
+        y_emb = None
         if y is not None:
-            adder=self.relu1(self.conv1(torch.reshape(y,(-1,1))))
-            adder2=self.relu2(self.conv2(adder))
-            t += adder2
+            y = y.float()
+            if y.dim() == 1:
+                y = y.unsqueeze(-1)
+            y_emb = self.label_emb(y)
+
+        # U-Net forward pass
         x1 = self.inc(x)
-        x2 = self.down1(x1, t)
+        x2 = self.down1(x1, t_emb, y_emb)
         x2 = self.sa1(x2)
-        x3 = self.down2(x2, t)
+        x3 = self.down2(x2, t_emb, y_emb)
         x3 = self.sa2(x3)
-        x4 = self.down3(x3, t)
+        x4 = self.down3(x3, t_emb, y_emb)
         x4 = self.sa3(x4)
 
         x4 = self.bot1(x4)
         x4 = self.bot2(x4)
         x4 = self.bot3(x4)
 
-        x = self.up1(x4, x3, t)
+        x = self.up1(x4, x3, t_emb, y_emb)
         x = self.sa4(x)
-        x = self.up2(x, x2, t)
+        x = self.up2(x, x2, t_emb, y_emb)
         x = self.sa5(x)
-        x = self.up3(x, x1, t)
+        x = self.up3(x, x1, t_emb, y_emb)
         x = self.sa6(x)
         output = self.outc(x)
         return output
-
